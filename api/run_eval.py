@@ -137,9 +137,14 @@ def transcribe_with_retry(
                                 and len(status["job"]["errors"]) > 0
                             ):
                                 errors = status["job"]["errors"]
-                                if "message" in errors[-1] and "failed to fetch file" in errors[-1]["message"]:
+                                if (
+                                    "message" in errors[-1]
+                                    and "failed to fetch file" in errors[-1]["message"]
+                                ):
                                     retries = max_retries + 1
-                                    raise Exception(f"could not fetch URL {audio_url}, not retrying")
+                                    raise Exception(
+                                        f"could not fetch URL {audio_url}, not retrying"
+                                    )
 
                         raise Exception(
                             f"Speechmatics transcription failed: {str(e)}"
@@ -257,9 +262,116 @@ def transcribe_with_retry(
 
                 return "".join(transcript_text) if transcript_text else ""
 
+            elif model_name.startswith("gladia/"):
+
+                def make_request(
+                    url, headers, method="GET", data=None, files=None, timeout=120
+                ):
+                    """
+                    Utility function
+                    """
+                    if method == "POST":
+                        if files:
+                            response = requests.post(
+                                url,
+                                headers=headers,
+                                data=data,
+                                files=files,
+                                timeout=timeout,
+                            )
+                        else:
+                            response = requests.post(
+                                url, headers=headers, json=data, timeout=timeout
+                            )
+                    else:
+                        response = requests.get(url, headers=headers, timeout=timeout)
+
+                    response.raise_for_status()
+                    return response.json()
+
+                api_key = os.getenv("GLADIA_API_KEY")
+                if not api_key:
+                    raise ValueError("GLADIA_API_KEY environment variable not set")
+
+                if use_url:
+                    # For URL-based transcription - use audio URL directly
+                    audio_url = sample["row"]["audio"][0]["src"]
+                else:
+                    # For file-based transcription - first upload, then get audio URL
+                    with open(audio_file_path, "rb") as file_content:
+                        upload_headers = {
+                            "x-gladia-key": api_key,
+                            "accept": "application/json",
+                        }
+                        files = [
+                            ("audio", (audio_file_path, file_content, "audio/wav"))
+                        ]
+                        upload_response = make_request(
+                            "https://api.gladia.io/v2/upload/",
+                            upload_headers,
+                            "POST",
+                            files=files,
+                        )
+                        audio_url = upload_response.get("audio_url")
+
+                headers = {
+                    "x-gladia-key": api_key,
+                    "accept": "application/json",
+                    "Content-Type": "application/json",
+                }
+
+                data = {
+                    "audio_url": audio_url,
+                    "model": model_name.split("/")[1],
+                }
+                post_response = make_request(
+                    "https://api.gladia.io/v2/pre-recorded/",
+                    headers,
+                    "POST",
+                    data=data,
+                )
+
+                result_url = post_response.get("result_url")
+                if result_url:
+                    while True:
+                        poll_response = make_request(result_url, headers)
+                        if poll_response.get("status") == "done":
+                            result = poll_response.get("result")
+                            break
+                        elif poll_response.get("status") == "error":
+                            raise Exception(
+                                f"Gladia transcription failed: {poll_response.get('error', 'Unknown error')}"
+                            )
+                        time.sleep(1)
+
+                    # Extract transcription text from the response
+                    if "transcription" in result:
+                        transcription_data = result["transcription"]
+
+                        if (
+                            isinstance(transcription_data, dict)
+                            and "full_transcript" in transcription_data
+                        ):
+                            return transcription_data["full_transcript"]
+                        elif (
+                            isinstance(transcription_data, dict)
+                            and "utterances" in transcription_data
+                        ):
+                            # Concatenate all utterance texts
+                            transcription_parts = []
+                            for utterance in transcription_data["utterances"]:
+                                if "text" in utterance:
+                                    transcription_parts.append(utterance["text"])
+
+                            return " ".join(transcription_parts)
+
+                    return ""
+                else:
+                    raise Exception("No result_url received from Gladia API")
+
             else:
                 raise ValueError(
-                    "Invalid model prefix, must start with 'assembly/', 'openai/', 'elevenlabs/' or 'revai/'"
+                    "Invalid model prefix, must start with 'assembly/', 'openai/', 'elevenlabs/', 'revai/', 'speechmatics/', or 'gladia/'"
                 )
 
         except Exception as e:
@@ -416,7 +528,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         required=True,
-        help="Prefix model name with 'assembly/', 'openai/', 'elevenlabs/', 'revai/', or 'speechmatics/'",
+        help="Prefix model name with 'assembly/', 'openai/', 'elevenlabs/', 'revai/', 'speechmatics/', or 'gladia/'",
     )
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument(
